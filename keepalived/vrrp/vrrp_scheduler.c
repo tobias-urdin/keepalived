@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <signal.h>
 #if defined _WITH_VRRP_AUTH_
 #include <netinet/in.h>
@@ -860,12 +861,12 @@ vrrp_dispatcher_read_timeout(sock_t *sock)
 static int
 vrrp_dispatcher_read(sock_t *sock)
 {
-	vrrp_t *vrrp;
+	vrrp_t *vrrp = NULL;
 	const vrrphdr_t *hd;
 	ssize_t len = 0;
 	int prev_state = 0;
 	sockaddr_t src_addr = { .ss_family = AF_UNSPEC };
-	vrrp_t vrrp_lookup;
+	vrrp_t *vrrp_lookup;
 #ifdef _NETWORK_TIMESTAMP_
 	char control_buf[128] __attribute__((aligned(__alignof__(struct cmsghdr))));
 #else
@@ -884,6 +885,9 @@ vrrp_dispatcher_read(sock_t *sock)
 	unsigned recv_data_count = 0;
 #endif
 	const struct iphdr *iph;
+	const struct ip6_hdr *ip6h;
+	bool is_multicast_lookup = false;
+	unicast_peer_t *unicast_peer;
 
 	/* Strategy here is to handle incoming adverts pending into socket recvq
 	 * but stop if receive 2nd advert for a VRID on socket (this applies to
@@ -983,8 +987,41 @@ vrrp_dispatcher_read(sock_t *sock)
 		if (__test_and_set_bit_array(hd->vrid, rx_vrid_map))
 			terminate_receiving = true;
 
-		vrrp_lookup.vrid = hd->vrid;
-		vrrp = rb_search(&sock->rb_vrid, &vrrp_lookup, rb_vrid, vrrp_vrid_cmp);
+		/* Determine if dest addr is multicast */
+		if (sock->family == AF_INET) {
+			iph = PTR_CAST_CONST(struct iphdr, vrrp_buffer);
+			is_multicast_lookup = IN_MULTICAST(htonl(iph->daddr));
+		} else {
+			ip6h = PTR_CAST_CONST(struct ip6_hdr, vrrp_buffer);
+			is_multicast_lookup = IN6_IS_ADDR_MULTICAST(&ip6h->ip6_dst);
+		}
+
+		/* Loop through VRRP instances and match VRID if it's multicast and
+		 * VRID and src address of packet against configured peers if unicast */
+		list_for_each_entry(vrrp_lookup, &vrrp_data->vrrp, e_list) {
+			if (hd->vrid != vrrp_lookup->vrid)
+				continue;
+
+			/* If dest address is multicast VRID is it matches */
+			if (is_multicast_lookup) {
+				vrrp = vrrp_lookup;
+				break;
+			}
+
+			if (!__test_bit(VRRP_FLAG_UNICAST, &vrrp_lookup->flags))
+				continue;
+
+			/* Loop through configured unicast peers and if matching source address this
+			 * is the instance we are looking for since VRID for unicast instances can overlap */
+			list_for_each_entry(unicast_peer, &vrrp_lookup->unicast_peer, e_list) {
+				if (inet_sockaddrcmp(&src_addr, &unicast_peer->address) == 0) {
+					vrrp = vrrp_lookup;
+					break;
+				}
+			}
+
+			/* Do nothing and fail because we didn't match any good instance */
+		}
 
 		/* No instance found => ignore the advert */
 		if (!vrrp) {
@@ -1004,8 +1041,7 @@ vrrp_dispatcher_read(sock_t *sock)
 		vrrp->pkt_saddr = src_addr;
 		vrrp->rx_ttl_hop_limit = -1;           /* Default to not received */
 		if (sock->family == AF_INET) {
-			iph = PTR_CAST_CONST(struct iphdr, vrrp_buffer);
-			vrrp->multicast_pkt = IN_MULTICAST(htonl(iph->daddr));
+			vrrp->multicast_pkt = is_multicast_lookup;
 			vrrp->rx_ttl_hop_limit = iph->ttl;
 		} else
 			vrrp->multicast_pkt = false;
